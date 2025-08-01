@@ -1,0 +1,7 @@
+.steam/
+.cache/
+.local/share/Trash/
+.wine/
+.vscode/
+.android/
+.zoom/
