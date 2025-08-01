@@ -3,6 +3,7 @@ import tarfile
 from pathlib import Path
 import subprocess
 from datetime import datetime
+import sys
 
 HOME_DIR = Path.home()
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -75,6 +76,14 @@ def should_ignore(path, ignore_set):
     return False
 
 
+def safe_unmount(path):
+    try:
+        subprocess.run(["umount", str(path)], check=True)
+        print(f"✅ Unmounted {path}")
+    except subprocess.CalledProcessError as e:
+        print(f"❗ Failed to unmount {path}: {e}")
+
+
 def create_backup(dest_dir):
     now = datetime.now()
     archive_name = f"home-backup-{Path().cwd().name}-{now.strftime('%Y%m%d_%H%M%S')}.tar.gz"
@@ -83,16 +92,44 @@ def create_backup(dest_dir):
 
     print(f"Creating an archive {archive_path}...")
 
-    with tarfile.open(archive_path, "w:gz") as tar:
-        for root, dirs, files in os.walk(HOME_DIR):
-            for name in files + dirs:
-                full_path = os.path.join(root, name)
-                if not should_ignore(full_path, ignore_set):
-                    try:
-                        print(os.path.relpath(full_path, HOME_DIR))
-                        tar.add(full_path, arcname=os.path.relpath(full_path, HOME_DIR))
-                    except Exception as e:
-                        print(f"❗ Failed to add {full_path}: {e}")
+    tar = None
+    try:
+        with tarfile.open(archive_path, "w:gz") as tar:
+            for root, dirs, files in os.walk(HOME_DIR):
+                for name in files:
+                    full_path = os.path.join(root, name)
+                    if not should_ignore(full_path, ignore_set):
+                        rel = os.path.relpath(full_path, HOME_DIR)
+                        try:
+                            print(f"Archiving: {rel}")
+                            tar.add(full_path, arcname=rel)
+                        except Exception as e:
+                            print(f"❗ Failed to add {rel}: {e}")
+                            
+                for name in dirs:
+                    full_path = os.path.join(root, name)
+                    if not should_ignore(full_path, ignore_set):
+                        rel = os.path.relpath(full_path, HOME_DIR)
+                        if not os.listdir(full_path):
+                            try:
+                                tar.add(full_path, arcname=rel)
+                            except Exception as e:
+                                print(f"❗ Failed to add folder {rel}: {e}")
+
+    except KeyboardInterrupt:
+        print("\n⚠️ Backup interrupted by user (Ctrl+C).")
+        if tar:
+            print("Closing archive to ensure it is saved properly...")
+            tar.close()
+        safe_unmount(dest_dir)
+        print(f"✅ Archive {archive_path} saved with files up to the last processed item.")
+        sys.exit(0)
+    except Exception as e:
+        print(f"❗ Error during backup: {e}")
+        if tar:
+            tar.close()
+        sys.exit(1)
+
     print("✅ Done!")
 
 
@@ -100,3 +137,4 @@ if __name__ == "__main__":
     mount_points = get_mount_points()
     dest = ask_user_path(mount_points)
     create_backup(dest)
+    safe_unmount(dest)
