@@ -8,6 +8,8 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich.progress import Progress, BarColumn, TextColumn, ProgressColumn
 from rich.text import Text
+from rich.live import Live
+from rich.console import Group
 import sys
 import argparse
 
@@ -15,10 +17,23 @@ HOME_DIR = Path.home()
 SCRIPT_DIR = Path(__file__).resolve().parent
 IGNORE_FILE = SCRIPT_DIR / ".backupignore"
 METADATA_FILE = SCRIPT_DIR / "backup_metadata.json"
+LARGE_FILE_THRESHOLD = 10 * 1024 * 1024  # 10 MB
 
 class FileCounterColumn(ProgressColumn):
     def render(self, task):
         return Text(f"{int(task.completed)}/{int(task.total)} files")
+
+class SizeProgressColumn(ProgressColumn):
+    def render(self, task):
+        completed_mb = task.completed / (1024 * 1024)
+        total_mb = task.total / (1024 * 1024) if task.total else 0
+        return Text(f"{completed_mb:.2f}/{total_mb:.2f} MB")
+
+class LargeFileProgressColumn(ProgressColumn):
+    def render(self, task):
+        completed_mb = task.completed / (1024 * 1024)
+        total_mb = task.total / (1024 * 1024) if task.total else 0
+        return Text(f"File: {completed_mb:.2f}/{total_mb:.2f} MB")
 
 def get_mount_points():
     possible_mount_dirs = [
@@ -78,7 +93,6 @@ def should_ignore(path, ignore_set):
     return False
 
 def calculate_file_hash(file_path):
-    """Calculate SHA-256 hash of a file."""
     sha256 = hashlib.sha256()
     try:
         with open(file_path, "rb") as f:
@@ -89,19 +103,16 @@ def calculate_file_hash(file_path):
         return None
 
 def load_metadata():
-    """Load previous backup metadata."""
     if METADATA_FILE.exists():
         with open(METADATA_FILE, "r") as f:
             return json.load(f)
     return {}
 
 def save_metadata(metadata):
-    """Save backup metadata."""
     with open(METADATA_FILE, "w") as f:
         json.dump(metadata, f, indent=4)
 
-def collect_files_for_backup(ignore_set, incremental=False, max_workers=8):
-    """Collect files for backup, optionally checking for changes."""
+def collect_files_for_backup(ignore_set, incremental=False, max_workers=10):
     all_files = []
     metadata = load_metadata() if incremental else {}
 
@@ -110,39 +121,41 @@ def collect_files_for_backup(ignore_set, incremental=False, max_workers=8):
         for root, dirs, files in os.walk(start_path):
             root_path = Path(root)
             if should_ignore(root_path, ignore_set):
-                dirs[:] = []  # Skip ignored directories
+                dirs[:] = []
                 continue
             for name in files:
                 full_path = root_path / name
                 if not should_ignore(full_path, ignore_set):
                     rel = os.path.relpath(full_path, HOME_DIR)
-                    if incremental:
-                        try:
+                    try:
+                        size = os.path.getsize(full_path)
+                        if incremental:
                             mtime = os.path.getmtime(full_path)
                             file_hash = calculate_file_hash(full_path)
                             prev_metadata = metadata.get(rel, {})
                             if file_hash and (prev_metadata.get("hash") != file_hash or prev_metadata.get("mtime") != mtime):
-                                result.append((str(full_path), rel, mtime, file_hash))
-                        except (OSError, PermissionError):
-                            continue
-                    else:
-                        result.append((str(full_path), rel, None, None))
+                                result.append((str(full_path), rel, mtime, file_hash, size))
+                        else:
+                            result.append((str(full_path), rel, None, None, size))
+                    except (OSError, PermissionError):
+                        continue
         return result
 
     for item in HOME_DIR.iterdir():
         if item.is_file() and not should_ignore(item, ignore_set):
             rel = os.path.relpath(item, HOME_DIR)
-            if incremental:
-                try:
+            try:
+                size = os.path.getsize(item)
+                if incremental:
                     mtime = os.path.getmtime(item)
                     file_hash = calculate_file_hash(item)
                     prev_metadata = metadata.get(rel, {})
                     if file_hash and (prev_metadata.get("hash") != file_hash or prev_metadata.get("mtime") != mtime):
-                        all_files.append((str(item), rel, mtime, file_hash))
-                except (OSError, PermissionError):
-                    continue
-            else:
-                all_files.append((str(item), rel, None, None))
+                        all_files.append((str(item), rel, mtime, file_hash, size))
+                else:
+                    all_files.append((str(item), rel, None, None, size))
+            except (OSError, PermissionError):
+                continue
 
     subdirs = [d for d in HOME_DIR.iterdir() if d.is_dir()]
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -159,6 +172,26 @@ def safe_unmount(path):
     except subprocess.CalledProcessError as e:
         print(f"\n❗ Failed to unmount {path}: {e}")
 
+def add_file_to_tar(tar, full_path, arcname, file_size, progress, large_file_task=None):
+    tarinfo = tar.gettarinfo(full_path, arcname=arcname)
+    tarinfo.mtime = os.path.getmtime(full_path)
+
+    if file_size > LARGE_FILE_THRESHOLD and large_file_task is not None:
+        progress.update(large_file_task, description=f"Adding {arcname}")
+        with open(full_path, "rb") as f:
+            bytes_written = 0
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                tar.fileobj.write(chunk)
+                bytes_written += len(chunk)
+                progress.update(large_file_task, advance=len(chunk))
+        tar.offset += tarinfo.size
+    else:
+        with open(full_path, "rb") as f:
+            tar.addfile(tarinfo, fileobj=f)
+
 def create_backup(dest_dir, incremental=False):
     now = datetime.now()
     backup_type = "incremental" if incremental else "full"
@@ -169,14 +202,16 @@ def create_backup(dest_dir, incremental=False):
     print(f"🔍 Scanning files for {backup_type} backup (with .backupignore)...")
     all_files = collect_files_for_backup(ignore_set, incremental)
     total_files = len(all_files)
+    total_size = sum(file_data[4] for file_data in all_files)
     estimated_time = round(max(3, total_files * 0.02))
 
     print(f"\n📦 Files to backup: {total_files}")
-    print(f"⏱️  Estimated time: {estimated_time} seconds")
+    print(f"💾 Total size: {total_size / (1024 * 1024):.2f} MB")
+    print(f"⏱️ Estimated time: {estimated_time} seconds")
     preview = min(15, total_files)
     print("📄 Sample files:")
     for i in range(preview):
-        print(f" - {all_files[i][1]}")
+        print(f" - {all_files[i][1]} ({all_files[i][4] / (1024 * 1024):.2f} MB)")
     if total_files > preview:
         print(f"...and {total_files - preview} more files.\n")
 
@@ -188,30 +223,59 @@ def create_backup(dest_dir, incremental=False):
     print(f"\n🔐 Creating {backup_type} archive: {archive_path}\n")
 
     new_metadata = {}
+
+    main_progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        FileCounterColumn(),
+        transient=False
+    )
+
+    large_file_progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        "[progress.percentage]{task.percentage:>3.0f}%",
+        LargeFileProgressColumn(),
+        transient=True
+    )
+
     try:
         with tarfile.open(archive_path, "w:gz") as tar, \
-             Progress(
-                 TextColumn("[progress.description]{task.description}"),
-                 BarColumn(),
-                 "[progress.percentage]{task.percentage:>3.0f}%",
-                 FileCounterColumn(),
-             ) as progress:
+             Live(Group(main_progress, large_file_progress), refresh_per_second=10):
 
-            task = progress.add_task("Backing up...", total=total_files)
+            task = main_progress.add_task("Creating backup...", total=total_files)
+            large_file_task = large_file_progress.add_task("Adding large file...", total=0, visible=False)
 
             for file_data in all_files:
-                full_path, rel, mtime, file_hash = file_data
+                full_path, rel, mtime, file_hash, size = file_data
                 try:
-                    print(f"Adding: {rel}")
-                    tar.add(full_path, arcname=rel)
+                    if size > LARGE_FILE_THRESHOLD:
+                        large_file_progress.update(
+                            large_file_task,
+                            completed=0,
+                            total=size,
+                            description=f"[cyan]Adding {rel}",
+                            visible=True
+                        )
+                        print(f"Adding large file: {rel} ({size / (1024 * 1024):.2f} MB)")
+                    else:
+                        large_file_progress.update(large_file_task, visible=False)
+                        print(f"Adding: {rel} ({size / (1024 * 1024):.2f} MB)")
+
+                    add_file_to_tar(tar, full_path, rel, size, large_file_progress, large_file_task)
+
                     if incremental:
                         new_metadata[rel] = {"mtime": mtime, "hash": file_hash}
+
+                    main_progress.update(task, advance=1)
+
                 except Exception as e:
                     print(f"❗ Failed to add {rel}: {e}")
-                progress.advance(task)
+                finally:
+                    large_file_progress.update(large_file_task, visible=False)
 
         if incremental:
-            # Update metadata with new files
             existing_metadata = load_metadata()
             existing_metadata.update(new_metadata)
             save_metadata(existing_metadata)
