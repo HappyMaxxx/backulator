@@ -13,6 +13,8 @@ from rich.console import Group
 import sys
 import argparse
 
+from restore_incremental import restore_incrementals
+
 HOME_DIR = Path.home()
 SCRIPT_DIR = Path(__file__).resolve().parent
 IGNORE_FILE = SCRIPT_DIR / ".backupignore"
@@ -34,6 +36,20 @@ class LargeFileProgressColumn(ProgressColumn):
         completed_mb = task.completed / (1024 * 1024)
         total_mb = task.total / (1024 * 1024) if task.total else 0
         return Text(f"File: {completed_mb:.2f}/{total_mb:.2f} MB")
+
+class ProgressFileReader:
+    def __init__(self, file_obj, progress, task_id):
+        self.file_obj = file_obj
+        self.progress = progress
+        self.task_id = task_id
+
+    def read(self, size):
+        data = self.file_obj.read(size)
+        self.progress.update(self.task_id, advance=len(data))
+        return data
+
+    def close(self):
+        self.file_obj.close()
 
 def get_mount_points():
     possible_mount_dirs = [
@@ -176,20 +192,13 @@ def add_file_to_tar(tar, full_path, arcname, file_size, progress, large_file_tas
     tarinfo = tar.gettarinfo(full_path, arcname=arcname)
     tarinfo.mtime = os.path.getmtime(full_path)
 
-    if file_size > LARGE_FILE_THRESHOLD and large_file_task is not None:
-        progress.update(large_file_task, description=f"Adding {arcname}")
-        with open(full_path, "rb") as f:
-            bytes_written = 0
-            while True:
-                chunk = f.read(65536)
-                if not chunk:
-                    break
-                tar.fileobj.write(chunk)
-                bytes_written += len(chunk)
-                progress.update(large_file_task, advance=len(chunk))
-        tar.offset += tarinfo.size
-    else:
-        with open(full_path, "rb") as f:
+    with open(full_path, "rb") as f:
+        if file_size > LARGE_FILE_THRESHOLD and large_file_task is not None:
+            progress.update(large_file_task, total=file_size, completed=0, description=f"Adding {arcname}", visible=True)
+            wrapper = ProgressFileReader(f, progress, large_file_task)
+            tar.addfile(tarinfo, fileobj=wrapper)
+            progress.update(large_file_task, visible=False)
+        else:
             tar.addfile(tarinfo, fileobj=f)
 
 def create_backup(dest_dir, incremental=False):
@@ -296,12 +305,21 @@ def create_backup(dest_dir, incremental=False):
     print(f"\n✅ {backup_type.capitalize()} backup complete!")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Create full or incremental backups.")
+    parser = argparse.ArgumentParser(description="Create full or incremental backups, or restore incremental ones.")
     parser.add_argument("--incremental", action="store_true", help="Perform an incremental backup")
+    parser.add_argument("--restore", action="store_true", help="Restore from incremental backups")
+    parser.add_argument("--backup-dir", type=Path, help="Directory containing incremental backups")
+    parser.add_argument("--dest", type=Path, help="Directory to restore into")
     args = parser.parse_args()
 
-    print()
-    mount_points = get_mount_points()
-    dest = ask_user_path(mount_points)
-    create_backup(dest, args.incremental)
-    safe_unmount(dest)
+    if args.restore:
+        if not args.backup_dir or not args.dest:
+            print("❌ --backup-dir and --dest must be provided for restore.")
+            sys.exit(1)
+        restore_incrementals(args.backup_dir, args.dest)
+    else:
+        print()
+        mount_points = get_mount_points()
+        dest = ask_user_path(mount_points)
+        create_backup(dest, args.incremental)
+        safe_unmount(dest)
