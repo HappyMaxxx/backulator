@@ -12,6 +12,7 @@ from rich.live import Live
 from rich.console import Group
 import sys
 import argparse
+import re
 
 from restore_incremental import restore_incrementals
 
@@ -94,17 +95,19 @@ def ask_user_path(mount_points):
 def load_ignore_list():
     ignore = set()
     if IGNORE_FILE.exists():
-        with open(IGNORE_FILE) as f:
+        with open(IGNORE_FILE, "r") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
-                    ignore.add(line)
+                    # Convert .backupignore patterns to regex
+                    pattern = re.escape(line).replace(r'\*', '.*').replace(r'\?', '.')
+                    ignore.add(pattern)
     return ignore
 
-def should_ignore(path, ignore_set):
+def should_ignore(path, ignore_patterns):
     rel_path = os.path.relpath(path, HOME_DIR)
-    for pattern in ignore_set:
-        if rel_path.startswith(pattern):
+    for pattern in ignore_patterns:
+        if re.match(pattern, rel_path) or re.match(pattern, rel_path + '/.*'):
             return True
     return False
 
@@ -128,20 +131,22 @@ def save_metadata(metadata):
     with open(METADATA_FILE, "w") as f:
         json.dump(metadata, f, indent=4)
 
-def collect_files_for_backup(ignore_set, incremental=False, max_workers=10):
+def collect_files_for_backup(ignore_patterns, incremental=False, max_workers=10):
     all_files = []
+    deleted_files = []
     metadata = load_metadata() if incremental else {}
+    existing_files = set(metadata.keys())
 
     def walk_dir(start_path):
         result = []
         for root, dirs, files in os.walk(start_path):
             root_path = Path(root)
-            if should_ignore(root_path, ignore_set):
+            if should_ignore(root_path, ignore_patterns):
                 dirs[:] = []
                 continue
             for name in files:
                 full_path = root_path / name
-                if not should_ignore(full_path, ignore_set):
+                if not should_ignore(full_path, ignore_patterns):
                     rel = os.path.relpath(full_path, HOME_DIR)
                     try:
                         size = os.path.getsize(full_path)
@@ -153,12 +158,14 @@ def collect_files_for_backup(ignore_set, incremental=False, max_workers=10):
                                 result.append((str(full_path), rel, mtime, file_hash, size))
                         else:
                             result.append((str(full_path), rel, None, None, size))
+                        if rel in existing_files:
+                            existing_files.remove(rel)
                     except (OSError, PermissionError):
                         continue
         return result
 
     for item in HOME_DIR.iterdir():
-        if item.is_file() and not should_ignore(item, ignore_set):
+        if item.is_file() and not should_ignore(item, ignore_patterns):
             rel = os.path.relpath(item, HOME_DIR)
             try:
                 size = os.path.getsize(item)
@@ -170,6 +177,8 @@ def collect_files_for_backup(ignore_set, incremental=False, max_workers=10):
                         all_files.append((str(item), rel, mtime, file_hash, size))
                 else:
                     all_files.append((str(item), rel, None, None, size))
+                if rel in existing_files:
+                    existing_files.remove(rel)
             except (OSError, PermissionError):
                 continue
 
@@ -179,7 +188,13 @@ def collect_files_for_backup(ignore_set, incremental=False, max_workers=10):
         for f in as_completed(futures):
             all_files.extend(f.result())
 
-    return all_files
+    # Mark remaining files in metadata as deleted
+    if incremental:
+        for rel in existing_files:
+            if not should_ignore(Path(HOME_DIR) / rel, ignore_patterns):
+                deleted_files.append(rel)
+
+    return all_files, deleted_files
 
 def safe_unmount(path):
     try:
@@ -206,15 +221,17 @@ def create_backup(dest_dir, incremental=False):
     backup_type = "incremental" if incremental else "full"
     archive_name = f"home-backup-{Path().cwd().name}-{backup_type}-{now.strftime('%Y%m%d_%H%M%S')}.tar.gz"
     archive_path = dest_dir / archive_name
-    ignore_set = load_ignore_list()
+    ignore_patterns = load_ignore_list()
 
     print(f"🔍 Scanning files for {backup_type} backup (with .backupignore)...")
-    all_files = collect_files_for_backup(ignore_set, incremental)
+    all_files, deleted_files = collect_files_for_backup(ignore_patterns, incremental)
     total_files = len(all_files)
     total_size = sum(file_data[4] for file_data in all_files)
     estimated_time = round(max(3, total_files * 0.02))
 
     print(f"\n📦 Files to backup: {total_files}")
+    if deleted_files:
+        print(f"🗑️ Files to mark as deleted: {len(deleted_files)}")
     print(f"💾 Total size: {total_size / (1024 * 1024):.2f} MB")
     print(f"⏱️ Estimated time: {estimated_time} seconds")
     preview = min(15, total_files)
@@ -223,6 +240,12 @@ def create_backup(dest_dir, incremental=False):
         print(f" - {all_files[i][1]} ({all_files[i][4] / (1024 * 1024):.2f} MB)")
     if total_files > preview:
         print(f"...and {total_files - preview} more files.\n")
+    if deleted_files:
+        print("🗑️ Sample deleted files:")
+        for i in range(min(5, len(deleted_files))):
+            print(f" - {deleted_files[i]}")
+        if len(deleted_files) > 5:
+            print(f"...and {len(deleted_files) - 5} more deleted files.\n")
 
     confirm = input("Proceed with backup? [Y/n]: ")
     if confirm.strip().lower() not in ["", "y", "yes"]:
@@ -232,6 +255,9 @@ def create_backup(dest_dir, incremental=False):
     print(f"\n🔐 Creating {backup_type} archive: {archive_path}\n")
 
     new_metadata = {}
+    if incremental:
+        existing_metadata = load_metadata()
+        new_metadata = existing_metadata.copy()
 
     main_progress = Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -253,7 +279,7 @@ def create_backup(dest_dir, incremental=False):
         with tarfile.open(archive_path, "w:gz") as tar, \
              Live(Group(main_progress, large_file_progress), refresh_per_second=10):
 
-            task = main_progress.add_task("Creating backup...", total=total_files)
+            task = main_progress.add_task("Creating backup...", total=total_files + len(deleted_files))
             large_file_task = large_file_progress.add_task("Adding large file...", total=0, visible=False)
 
             for file_data in all_files:
@@ -275,7 +301,7 @@ def create_backup(dest_dir, incremental=False):
                     add_file_to_tar(tar, full_path, rel, size, large_file_progress, large_file_task)
 
                     if incremental:
-                        new_metadata[rel] = {"mtime": mtime, "hash": file_hash}
+                        new_metadata[rel] = {"mtime": mtime, "hash": file_hash, "status": "present"}
 
                     main_progress.update(task, advance=1)
 
@@ -284,10 +310,13 @@ def create_backup(dest_dir, incremental=False):
                 finally:
                     large_file_progress.update(large_file_task, visible=False)
 
-        if incremental:
-            existing_metadata = load_metadata()
-            existing_metadata.update(new_metadata)
-            save_metadata(existing_metadata)
+            # Add deleted files to metadata
+            for rel in deleted_files:
+                new_metadata[rel] = {"status": "deleted"}
+                print(f"Marking as deleted: {rel}")
+                main_progress.update(task, advance=1)
+
+        save_metadata(new_metadata)
 
     except KeyboardInterrupt:
         print("\n⚠️ Backup interrupted by user (Ctrl+C).")
