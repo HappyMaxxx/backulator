@@ -3,6 +3,7 @@ import tarfile
 import subprocess
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,9 +12,9 @@ from rich.text import Text
 from rich.live import Live
 from rich.console import Group
 import sys
-import argparse
 import re
 
+from parse_args import parse_args
 from restore_incremental import restore_incrementals
 
 HOME_DIR = Path.home()
@@ -79,11 +80,14 @@ def ask_user_path(mount_points):
         print("Devices found:")
         for i, mp in enumerate(mount_points):
             print(f"[{i + 1}] {mp}")
-        choice = input("Select the flash drive number or press Enter to cancel: ")
-        if choice.strip().isdigit():
-            idx = int(choice.strip()) - 1
-            if 0 <= idx < len(mount_points):
-                return Path(mount_points[idx])
+        while True:
+            choice = input("Select the flash drive number or press Enter to cancel: ")
+            if not choice.strip():
+                return None
+            if choice.strip().isdigit() and 1 <= int(choice) <= len(mount_points):
+                return Path(mount_points[int(choice) - 1])
+            print("❗ Invalid input. Please enter a valid number.")
+
     print("No flash drive found or selected.")
     confirm = input("The backup will be saved in your home directory. Continue? [y/N]: ")
     if confirm.lower().startswith("y"):
@@ -221,6 +225,7 @@ def create_backup(dest_dir, incremental=False):
     backup_type = "incremental" if incremental else "full"
     archive_name = f"home-backup-{Path().cwd().name}-{backup_type}-{now.strftime('%Y%m%d_%H%M%S')}.tar.gz"
     archive_path = dest_dir / archive_name
+    disk = shutil.disk_usage(dest_dir)
     ignore_patterns = load_ignore_list()
 
     print(f"🔍 Scanning files for {backup_type} backup (with .backupignore)...")
@@ -233,6 +238,7 @@ def create_backup(dest_dir, incremental=False):
     if deleted_files:
         print(f"🗑️ Files to mark as deleted: {len(deleted_files)}")
     print(f"💾 Total size: {total_size / (1024 * 1024):.2f} MB")
+    print(f"🖴 Free disk space: {disk.free / (1024 * 1024):.2f} MB")
     print(f"⏱️ Estimated time: {estimated_time} seconds")
     preview = min(15, total_files)
     print("📄 Sample files:")
@@ -250,6 +256,10 @@ def create_backup(dest_dir, incremental=False):
     confirm = input("Proceed with backup? [Y/n]: ")
     if confirm.strip().lower() not in ["", "y", "yes"]:
         print("❌ Cancelled.")
+        exit(0)
+
+    if disk.free < total_size * 1.1: # Just in case, add 10%.
+        print("❗ Not enough disk space!")
         exit(0)
 
     print(f"\n🔐 Creating {backup_type} archive: {archive_path}\n")
@@ -334,12 +344,7 @@ def create_backup(dest_dir, incremental=False):
     print(f"\n✅ {backup_type.capitalize()} backup complete!")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Create full or incremental backups, or restore incremental ones.")
-    parser.add_argument("--incremental", action="store_true", help="Perform an incremental backup")
-    parser.add_argument("--restore", action="store_true", help="Restore from incremental backups")
-    parser.add_argument("--backup-dir", type=Path, help="Directory containing incremental backups")
-    parser.add_argument("--dest", type=Path, help="Directory to restore into")
-    args = parser.parse_args()
+    args = parse_args()
 
     if args.restore:
         if not args.backup_dir or not args.dest:

@@ -11,6 +11,25 @@ SCRIPT_DIR=$(dirname "$(realpath "$0")") || {
     exit 1
 }
 
+# Check for -h or --help arguments
+for arg in "$@"; do
+    if [ "$arg" = "-h" ] || [ "$arg" = "--help" ]; then
+        # Check if python3 is installed
+        if ! command -v python3 &>/dev/null; then
+            echo -e "${RED}Error: python3 is not installed. Please install Python 3.6 or higher.${NC}"
+            exit 1
+        fi
+        # Check if parse_args.py exists
+        if [ ! -f "$SCRIPT_DIR/parse_args.py" ]; then
+            echo -e "${RED}Error: parse_args.py not found in $SCRIPT_DIR${NC}"
+            exit 1
+        fi
+        # Run parse_args.py to display the help message
+        python3 "$SCRIPT_DIR/parse_args.py" --help
+        exit 0
+    fi
+done
+
 # Check if python3 is installed
 if ! command -v python3 &>/dev/null; then
     echo -e "${RED}Error: python3 is not installed. Please install Python 3.6 or higher.${NC}"

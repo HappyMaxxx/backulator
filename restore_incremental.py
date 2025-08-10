@@ -5,8 +5,9 @@ import json
 from datetime import datetime
 import re
 from rich.progress import Progress, BarColumn, TextColumn
-from rich.console import Group
 from rich.live import Live
+
+from parse_args import parse_restore
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 IGNORE_FILE = SCRIPT_DIR / ".backupignore"
@@ -139,9 +140,5 @@ def restore_incrementals(backup_dir, dest_dir):
     print(f"\n✅ Restore complete! Restored {len(processed_files)} files to {dest_dir}")
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Restore incremental backups.")
-    parser.add_argument("--backup-dir", type=Path, required=True, help="Directory containing incremental backups")
-    parser.add_argument("--dest", type=Path, required=True, help="Directory to restore into")
-    args = parser.parse_args()
+    args = parse_restore()
     restore_incrementals(args.backup_dir, args.dest)
