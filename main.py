@@ -11,6 +11,7 @@ from rich.progress import Progress, BarColumn, TextColumn, ProgressColumn
 from rich.text import Text
 from rich.live import Live
 from rich.console import Group
+from pyfiglet import Figlet
 import sys
 import re
 
@@ -22,6 +23,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 IGNORE_FILE = SCRIPT_DIR / ".backupignore"
 METADATA_FILE = SCRIPT_DIR / "backup_metadata.json"
 LARGE_FILE_THRESHOLD = 10 * 1024 * 1024  # 10 MB
+f = Figlet(font='graffiti')
 
 class FileCounterColumn(ProgressColumn):
     def render(self, task):
@@ -75,7 +77,10 @@ def get_mount_points():
 
     return sorted(mount_points)
 
-def ask_user_path(mount_points):
+def ask_user_path(mount_points, silent=False):
+    if silent:
+        return Path(mount_points[0]) if mount_points else HOME_DIR
+    
     if mount_points:
         print("Devices found:")
         for i, mp in enumerate(mount_points):
@@ -220,7 +225,7 @@ def add_file_to_tar(tar, full_path, arcname, file_size, progress, large_file_tas
         else:
             tar.addfile(tarinfo, fileobj=f)
 
-def create_backup(dest_dir, incremental=False):
+def create_backup(dest_dir, incremental=False, silent=False):
     now = datetime.now()
     backup_type = "incremental" if incremental else "full"
     archive_name = f"home-backup-{Path().cwd().name}-{backup_type}-{now.strftime('%Y%m%d_%H%M%S')}.tar.gz"
@@ -228,41 +233,50 @@ def create_backup(dest_dir, incremental=False):
     disk = shutil.disk_usage(dest_dir)
     ignore_patterns = load_ignore_list()
 
-    print(f"🔍 Scanning files for {backup_type} backup (with .backupignore)...")
-    all_files, deleted_files = collect_files_for_backup(ignore_patterns, incremental)
+    if not silent:
+        print(f"🔍 Scanning files for {backup_type} backup (with .backupignore)...")
+    
+    try:
+        all_files, deleted_files = collect_files_for_backup(ignore_patterns, incremental)
+    except KeyboardInterrupt:
+        print("\n⚠️ Backup interrupted by user (Ctrl+C).")
+        sys.exit(0)
+
     total_files = len(all_files)
     total_size = sum(file_data[4] for file_data in all_files)
     estimated_time = round(max(3, total_files * 0.02))
+ 
+    if not silent:
+        print(f"\n📦 Files to backup: {total_files}")
+        if deleted_files:
+            print(f"🗑️ Files to mark as deleted: {len(deleted_files)}")
+        print(f"💾 Total size: {total_size / (1024 * 1024):.2f} MB")
+        print(f"🖴 Free disk space: {disk.free / (1024 * 1024):.2f} MB")
+        print(f"⏱️ Estimated time: {estimated_time} seconds")
+        preview = min(15, total_files)
+        print("📄 Sample files:")
+        for i in range(preview):
+            print(f" - {all_files[i][1]} ({all_files[i][4] / (1024 * 1024):.2f} MB)")
+        if total_files > preview:
+            print(f"...and {total_files - preview} more files.\n")
+        if deleted_files:
+            print("🗑️ Sample deleted files:")
+            for i in range(min(5, len(deleted_files))):
+                print(f" - {deleted_files[i]}")
+            if len(deleted_files) > 5:
+                print(f"...and {len(deleted_files) - 5} more deleted files.\n")
 
-    print(f"\n📦 Files to backup: {total_files}")
-    if deleted_files:
-        print(f"🗑️ Files to mark as deleted: {len(deleted_files)}")
-    print(f"💾 Total size: {total_size / (1024 * 1024):.2f} MB")
-    print(f"🖴 Free disk space: {disk.free / (1024 * 1024):.2f} MB")
-    print(f"⏱️ Estimated time: {estimated_time} seconds")
-    preview = min(15, total_files)
-    print("📄 Sample files:")
-    for i in range(preview):
-        print(f" - {all_files[i][1]} ({all_files[i][4] / (1024 * 1024):.2f} MB)")
-    if total_files > preview:
-        print(f"...and {total_files - preview} more files.\n")
-    if deleted_files:
-        print("🗑️ Sample deleted files:")
-        for i in range(min(5, len(deleted_files))):
-            print(f" - {deleted_files[i]}")
-        if len(deleted_files) > 5:
-            print(f"...and {len(deleted_files) - 5} more deleted files.\n")
-
-    confirm = input("Proceed with backup? [Y/n]: ")
-    if confirm.strip().lower() not in ["", "y", "yes"]:
-        print("❌ Cancelled.")
-        exit(0)
+        confirm = input("Proceed with backup? [Y/n]: ")
+        if confirm.strip().lower() not in ["", "y", "yes"]:
+            print("❌ Cancelled.")
+            exit(0)
 
     if disk.free < total_size * 1.1: # Just in case, add 10%.
         print("❗ Not enough disk space!")
         exit(0)
 
-    print(f"\n🔐 Creating {backup_type} archive: {archive_path}\n")
+    if not silent:
+        print(f"\n🔐 Creating {backup_type} archive: {archive_path}\n")
 
     new_metadata = {}
     if incremental:
@@ -274,7 +288,7 @@ def create_backup(dest_dir, incremental=False):
         BarColumn(),
         "[progress.percentage]{task.percentage:>3.0f}%",
         FileCounterColumn(),
-        transient=False
+        transient=silent
     )
 
     large_file_progress = Progress(
@@ -282,7 +296,7 @@ def create_backup(dest_dir, incremental=False):
         BarColumn(),
         "[progress.percentage]{task.percentage:>3.0f}%",
         LargeFileProgressColumn(),
-        transient=True
+        transient=silent
     )
 
     try:
@@ -296,17 +310,19 @@ def create_backup(dest_dir, incremental=False):
                 full_path, rel, mtime, file_hash, size = file_data
                 try:
                     if size > LARGE_FILE_THRESHOLD:
-                        large_file_progress.update(
-                            large_file_task,
-                            completed=0,
-                            total=size,
-                            description=f"[cyan]Adding {rel}",
-                            visible=True
-                        )
-                        print(f"Adding large file: {rel} ({size / (1024 * 1024):.2f} MB)")
+                        if not silent:
+                            large_file_progress.update(
+                                large_file_task,
+                                completed=0,
+                                total=size,
+                                description=f"[cyan]Adding {rel}",
+                                visible=True
+                            )
+                            print(f"Adding large file: {rel} ({size / (1024 * 1024):.2f} MB)")
                     else:
-                        large_file_progress.update(large_file_task, visible=False)
-                        print(f"Adding: {rel} ({size / (1024 * 1024):.2f} MB)")
+                        if not silent:
+                            large_file_progress.update(large_file_task, visible=False)
+                            print(f"Adding: {rel} ({size / (1024 * 1024):.2f} MB)")
 
                     add_file_to_tar(tar, full_path, rel, size, large_file_progress, large_file_task)
 
@@ -318,13 +334,15 @@ def create_backup(dest_dir, incremental=False):
                 except Exception as e:
                     print(f"❗ Failed to add {rel}: {e}")
                 finally:
-                    large_file_progress.update(large_file_task, visible=False)
+                    if not silent:
+                        large_file_progress.update(large_file_task, visible=False)
 
             # Add deleted files to metadata
-            for rel in deleted_files:
-                new_metadata[rel] = {"status": "deleted"}
-                print(f"Marking as deleted: {rel}")
-                main_progress.update(task, advance=1)
+            if not silent:
+                for rel in deleted_files:
+                    new_metadata[rel] = {"status": "deleted"}
+                    print(f"Marking as deleted: {rel}")
+                    main_progress.update(task, advance=1)
 
         save_metadata(new_metadata)
 
@@ -339,21 +357,25 @@ def create_backup(dest_dir, incremental=False):
         print(f"❗ Error during backup: {e}")
         if 'tar' in locals():
             tar.close()
+        safe_unmount(dest_dir)
         sys.exit(1)
 
-    print(f"\n✅ {backup_type.capitalize()} backup complete!")
+    if not silent:
+        print(f"\n✅ {backup_type.capitalize()} backup complete!")
 
 if __name__ == "__main__":
     args = parse_args()
 
+    if not args.silent:
+        print()
+        print(f.renderText('Backulator'))
     if args.restore:
         if not args.backup_dir or not args.dest:
             print("❌ --backup-dir and --dest must be provided for restore.")
             sys.exit(1)
         restore_incrementals(args.backup_dir, args.dest)
     else:
-        print()
         mount_points = get_mount_points()
-        dest = ask_user_path(mount_points)
-        create_backup(dest, args.incremental)
+        dest = ask_user_path(mount_points, args.silent)
+        create_backup(dest, args.incremental, args.silent)
         safe_unmount(dest)

@@ -2,3 +2,4 @@ backup_metadata.json
 __pycache__/
 venv/
 diff.txt
+font_tester.py
