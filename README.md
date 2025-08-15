@@ -83,6 +83,14 @@ Backulator is a Python-based utility designed to create backups of a user's home
    ```
    - The restore process will process all `.tar.gz` backup files in the specified backup directory, applying full and incremental backups in chronological order, respecting the `.backupignore` file and metadata to restore the latest versions of files.
 
+7. To run the backup in silent mode (suppressing interactive prompts and progress output):
+   ```bash
+   ./run.sh --silent
+   ```
+   The --silence option disables interactive prompts (e.g., drive selection or confirmation) and progress bars, making it suitable for automated scripts or background tasks. In this mode, the backup is saved to the default location (home directory if no external drive is detected) without user input.
+
+   > **Important**: In this mode, the first available flash drive is selected, or if no flash drives are found, it saves to the home directory.
+
 ## Incremental Backups
 - **How It Works**: Incremental backups only include files that have changed since the last backup (full or incremental). The program tracks changes using file modification times and SHA-256 hashes stored in `backup_metadata.json`.
 - **Metadata**: The `backup_metadata.json` file stores file paths, modification times, hashes, and status (e.g., "present" or "deleted") to determine which files need to be backed up or marked as deleted.
