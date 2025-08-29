@@ -21,7 +21,6 @@ from restore_incremental import restore_incrementals
 HOME_DIR = Path.home()
 SCRIPT_DIR = Path(__file__).resolve().parent
 IGNORE_FILE = SCRIPT_DIR / ".backupignore"
-METADATA_FILE = SCRIPT_DIR / "backup_metadata.json"
 LARGE_FILE_THRESHOLD = 10 * 1024 * 1024  # 10 MB
 f = Figlet(font='graffiti')
 
@@ -54,6 +53,9 @@ class ProgressFileReader:
 
     def close(self):
         self.file_obj.close()
+
+def get_metadata_file(dest_dir):
+    return Path(dest_dir) / "backup_metadata.json"
 
 def get_mount_points():
     possible_mount_dirs = [
@@ -130,20 +132,22 @@ def calculate_file_hash(file_path):
     except (IOError, PermissionError):
         return None
 
-def load_metadata():
-    if METADATA_FILE.exists():
-        with open(METADATA_FILE, "r") as f:
+def load_metadata(dest_dir):
+    metadata_file = get_metadata_file(dest_dir)
+    if metadata_file.exists():
+        with open(metadata_file, "r") as f:
             return json.load(f)
     return {}
 
-def save_metadata(metadata):
-    with open(METADATA_FILE, "w") as f:
+def save_metadata(metadata, dest_dir):
+    metadata_file = get_metadata_file(dest_dir)
+    with open(metadata_file, "w") as f:
         json.dump(metadata, f, indent=4)
 
-def collect_files_for_backup(ignore_patterns, incremental=False, max_workers=10):
+def collect_files_for_backup(ignore_patterns, dest_dir, incremental=False, max_workers=10):
     all_files = []
     deleted_files = []
-    metadata = load_metadata() if incremental else {}
+    metadata = load_metadata(dest_dir) if incremental else {}
     existing_files = set(metadata.keys())
 
     def walk_dir(start_path):
@@ -237,7 +241,7 @@ def create_backup(dest_dir, incremental=False, silent=False):
         print(f"🔍 Scanning files for {backup_type} backup (with .backupignore)...")
     
     try:
-        all_files, deleted_files = collect_files_for_backup(ignore_patterns, incremental)
+        all_files, deleted_files = collect_files_for_backup(ignore_patterns, dest_dir, incremental)
     except KeyboardInterrupt:
         print("\n⚠️ Backup interrupted by user (Ctrl+C).")
         sys.exit(0)
@@ -280,7 +284,7 @@ def create_backup(dest_dir, incremental=False, silent=False):
 
     new_metadata = {}
     if incremental:
-        existing_metadata = load_metadata()
+        existing_metadata = load_metadata(dest_dir)
         new_metadata = existing_metadata.copy()
 
     main_progress = Progress(
@@ -344,7 +348,7 @@ def create_backup(dest_dir, incremental=False, silent=False):
                     print(f"Marking as deleted: {rel}")
                     main_progress.update(task, advance=1)
 
-        save_metadata(new_metadata)
+        save_metadata(new_metadata, dest_dir)
 
     except KeyboardInterrupt:
         print("\n⚠️ Backup interrupted by user (Ctrl+C).")

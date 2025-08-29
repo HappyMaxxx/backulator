@@ -11,7 +11,9 @@ from parse_args import parse_restore
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 IGNORE_FILE = SCRIPT_DIR / ".backupignore"
-METADATA_FILE = SCRIPT_DIR / "backup_metadata.json"
+
+def get_metadata_file(backup_dir):
+    return Path(backup_dir) / "backup_metadata.json"
 
 def load_ignore_list():
     ignore = set()
@@ -32,9 +34,10 @@ def should_ignore(path, ignore_patterns):
             return True
     return False
 
-def load_metadata():
-    if METADATA_FILE.exists():
-        with open(METADATA_FILE, "r") as f:
+def load_metadata(backup_dir):
+    metadata_file = get_metadata_file(backup_dir)
+    if metadata_file.exists():
+        with open(metadata_file, "r") as f:
             return json.load(f)
     return {}
 
@@ -56,7 +59,7 @@ def restore_incrementals(backup_dir, dest_dir):
     backup_dir = Path(backup_dir).resolve()
     dest_dir = Path(dest_dir).resolve()
     ignore_patterns = load_ignore_list()
-    metadata = load_metadata()
+    metadata = load_metadata(backup_dir)
     backup_files = get_backup_files(backup_dir)
 
     if not backup_files:
