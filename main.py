@@ -144,7 +144,7 @@ def save_metadata(metadata, dest_dir):
     with open(metadata_file, "w") as f:
         json.dump(metadata, f, indent=4)
 
-def collect_files_for_backup(ignore_patterns, dest_dir, incremental=False, max_workers=10):
+def collect_files_for_backup(ignore_patterns, dest_dir, incremental=False,  fast=False, max_workers=10):
     all_files = []
     deleted_files = []
     metadata = load_metadata(dest_dir) if incremental else {}
@@ -165,12 +165,15 @@ def collect_files_for_backup(ignore_patterns, dest_dir, incremental=False, max_w
                         size = os.path.getsize(full_path)
                         if incremental:
                             mtime = os.path.getmtime(full_path)
-                            file_hash = calculate_file_hash(full_path)
                             prev_metadata = metadata.get(rel, {})
-                            if file_hash and (prev_metadata.get("hash") != file_hash or prev_metadata.get("mtime") != mtime):
-                                result.append((str(full_path), rel, mtime, file_hash, size))
-                        else:
-                            result.append((str(full_path), rel, None, None, size))
+                            
+                            if fast:
+                                if prev_metadata.get("mtime") != mtime or prev_metadata.get("size") != size:
+                                    result.append((str(full_path), rel, mtime, None, size))
+                            else:
+                                file_hash = calculate_file_hash(full_path)
+                                if file_hash and (prev_metadata.get("hash") != file_hash or prev_metadata.get("mtime") != mtime):
+                                    result.append((str(full_path), rel, mtime, file_hash, size))
                         if rel in existing_files:
                             existing_files.remove(rel)
                     except (OSError, PermissionError):
@@ -229,7 +232,7 @@ def add_file_to_tar(tar, full_path, arcname, file_size, progress, large_file_tas
         else:
             tar.addfile(tarinfo, fileobj=f)
 
-def create_backup(dest_dir, incremental=False, silent=False):
+def create_backup(dest_dir, incremental=False, silent=False, fast=False):
     now = datetime.now()
     backup_type = "incremental" if incremental else "full"
     archive_name = f"home-backup-{Path().cwd().name}-{backup_type}-{now.strftime('%Y%m%d_%H%M%S')}.tar.gz"
@@ -241,7 +244,7 @@ def create_backup(dest_dir, incremental=False, silent=False):
         print(f"🔍 Scanning files for {backup_type} backup (with .backupignore)...")
     
     try:
-        all_files, deleted_files = collect_files_for_backup(ignore_patterns, dest_dir, incremental)
+        all_files, deleted_files = collect_files_for_backup(ignore_patterns, dest_dir, incremental, fast)
     except KeyboardInterrupt:
         print("\n⚠️ Backup interrupted by user (Ctrl+C).")
         sys.exit(0)
@@ -275,7 +278,7 @@ def create_backup(dest_dir, incremental=False, silent=False):
             print("❌ Cancelled.")
             exit(0)
 
-    if disk.free < total_size * 1.1: # Just in case, add 10%.
+    if disk.free < total_size * 1.1:  # Just in case, add 10%.
         print("❗ Not enough disk space!")
         exit(0)
 
@@ -331,7 +334,10 @@ def create_backup(dest_dir, incremental=False, silent=False):
                     add_file_to_tar(tar, full_path, rel, size, large_file_progress, large_file_task)
 
                     if incremental:
-                        new_metadata[rel] = {"mtime": mtime, "hash": file_hash, "status": "present"}
+                        if fast:
+                            new_metadata[rel] = {"mtime": mtime, "size": size, "status": "present"}
+                        else:
+                            new_metadata[rel] = {"mtime": mtime, "hash": file_hash, "status": "present"}
 
                     main_progress.update(task, advance=1)
 
@@ -381,5 +387,5 @@ if __name__ == "__main__":
     else:
         mount_points = get_mount_points()
         dest = ask_user_path(mount_points, args.silent)
-        create_backup(dest, args.incremental, args.silent)
+        create_backup(dest, args.incremental, args.silent, args.fast)
         safe_unmount(dest)
