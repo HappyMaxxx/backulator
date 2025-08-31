@@ -12,6 +12,7 @@ from rich.text import Text
 from rich.live import Live
 from rich.console import Group
 from pyfiglet import Figlet
+import logging
 import sys
 import re
 
@@ -23,6 +24,24 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 IGNORE_FILE = SCRIPT_DIR / ".backupignore"
 LARGE_FILE_THRESHOLD = 10 * 1024 * 1024  # 10 MB
 f = Figlet(font='graffiti')
+
+LOG_FILE = SCRIPT_DIR / "backup.log"
+
+# Configure logging
+try:
+    logger = logging.getLogger("backup")
+    logger.setLevel(logging.DEBUG)
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.WARNING)  # консоль тільки для попереджень/помилок
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    file_handler.setFormatter(formatter)
+    stream_handler.setFormatter(formatter)
+    logger.handlers = [file_handler, stream_handler]
+except Exception as e:
+    print(f"❗ Failed to initialize logging: {e}")
+    sys.exit(1)
 
 class FileCounterColumn(ProgressColumn):
     def render(self, task):
@@ -66,23 +85,26 @@ def get_mount_points():
     ]
 
     mount_points = set()
-    result = subprocess.run(["lsblk", "-o", "NAME,MOUNTPOINT"], capture_output=True, text=True)
-    lines = result.stdout.strip().split('\n')[1:]
+    try:
+        result = subprocess.run(["lsblk", "-o", "NAME,MOUNTPOINT"], capture_output=True, text=True)
+        lines = result.stdout.strip().split('\n')[1:]
 
-    for line in lines:
-        parts = line.strip().split(None, 1)
-        if len(parts) == 2:
-            mountpoint = parts[1]
-            for base in possible_mount_dirs:
-                if mountpoint.startswith(base):
-                    mount_points.add(mountpoint)
-
-    return sorted(mount_points)
+        for line in lines:
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2:
+                mountpoint = parts[1]
+                for base in possible_mount_dirs:
+                    if mountpoint.startswith(base):
+                        mount_points.add(mountpoint)
+        return sorted(mount_points)
+    except subprocess.SubprocessError as e:
+        logger.error(f"Failed to get mount points: {e}")
+        return []
 
 def ask_user_path(mount_points, silent=False):
     if silent:
         return Path(mount_points[0]) if mount_points else HOME_DIR
-    
+
     if mount_points:
         print("Devices found:")
         for i, mp in enumerate(mount_points):
@@ -105,15 +127,18 @@ def ask_user_path(mount_points, silent=False):
 
 def load_ignore_list():
     ignore = set()
-    if IGNORE_FILE.exists():
-        with open(IGNORE_FILE, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    # Convert .backupignore patterns to regex
-                    pattern = re.escape(line).replace(r'\*', '.*').replace(r'\?', '.')
-                    ignore.add(pattern)
-    return ignore
+    try:
+        if IGNORE_FILE.exists():
+            with open(IGNORE_FILE, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        pattern = re.escape(line).replace(r'\\*', '.*').replace(r'\\?', '.')
+                        ignore.add(pattern)
+        return ignore
+    except Exception as e:
+        logger.error(f"Failed to load ignore list: {e}")
+        return set()
 
 def should_ignore(path, ignore_patterns):
     rel_path = os.path.relpath(path, HOME_DIR)
@@ -129,56 +154,79 @@ def calculate_file_hash(file_path):
             for chunk in iter(lambda: f.read(4096), b""):
                 sha256.update(chunk)
         return sha256.hexdigest()
-    except (IOError, PermissionError):
+    except (IOError, PermissionError) as e:
+        logger.error(f"Failed to calculate hash for {file_path}: {e}")
         return None
 
 def load_metadata(dest_dir):
     metadata_file = get_metadata_file(dest_dir)
-    if metadata_file.exists():
-        with open(metadata_file, "r") as f:
-            return json.load(f)
-    return {}
+    try:
+        if metadata_file.exists():
+            with open(metadata_file, "r") as f:
+                return json.load(f)
+        return {}
+    except Exception as e:
+        logger.error(f"Failed to load metadata: {e}")
+        return {}
 
 def save_metadata(metadata, dest_dir):
     metadata_file = get_metadata_file(dest_dir)
-    with open(metadata_file, "w") as f:
-        json.dump(metadata, f, indent=4)
+    try:
+        with open(metadata_file, "w") as f:
+            json.dump(metadata, f, indent=4)
+    except Exception as e:
+        logger.error(f"Failed to save metadata: {e}")
 
-def collect_files_for_backup(ignore_patterns, dest_dir, incremental=False,  fast=False, max_workers=10):
+def collect_files_for_backup(ignore_patterns, dest_dir, incremental=False, fast=False, max_workers=10):
+    logger.info(f"Collecting files for backup, incremental={incremental}, fast={fast}")
     all_files = []
     deleted_files = []
     metadata = load_metadata(dest_dir) if incremental else {}
     existing_files = set(metadata.keys())
 
+    def is_changed_fast(prev_meta, mtime_int, size):
+        prev_mtime = int(prev_meta.get("mtime", 0)) if isinstance(prev_meta.get("mtime"), (int, float)) else 0
+        if "hash" in prev_meta:
+            return prev_mtime != mtime_int
+        if "size" in prev_meta:
+            return prev_mtime != mtime_int or prev_meta.get("size") != size
+        return True
+
     def walk_dir(start_path):
         result = []
-        for root, dirs, files in os.walk(start_path):
-            root_path = Path(root)
-            if should_ignore(root_path, ignore_patterns):
-                dirs[:] = []
-                continue
-            for name in files:
-                full_path = root_path / name
-                if not should_ignore(full_path, ignore_patterns):
+        try:
+            for root, dirs, files in os.walk(start_path):
+                root_path = Path(root)
+                if should_ignore(root_path, ignore_patterns):
+                    dirs[:] = []
+                    continue
+                for name in files:
+                    full_path = root_path / name
+                    if should_ignore(full_path, ignore_patterns):
+                        continue
                     rel = os.path.relpath(full_path, HOME_DIR)
                     try:
                         size = os.path.getsize(full_path)
                         if incremental:
-                            mtime = os.path.getmtime(full_path)
-                            prev_metadata = metadata.get(rel, {})
-                            
+                            mtime_int = int(os.path.getmtime(full_path))
+                            prev = metadata.get(rel, {})
                             if fast:
-                                if prev_metadata.get("mtime") != mtime or prev_metadata.get("size") != size:
-                                    result.append((str(full_path), rel, mtime, None, size))
+                                if is_changed_fast(prev, mtime_int, size):
+                                    result.append((str(full_path), rel, mtime_int, None, size))
                             else:
                                 file_hash = calculate_file_hash(full_path)
-                                if file_hash and (prev_metadata.get("hash") != file_hash or prev_metadata.get("mtime") != mtime):
-                                    result.append((str(full_path), rel, mtime, file_hash, size))
-                        if rel in existing_files:
-                            existing_files.remove(rel)
+                                if file_hash and (prev.get("hash") != file_hash or int(prev.get("mtime", 0)) != mtime_int):
+                                    result.append((str(full_path), rel, mtime_int, file_hash, size))
+                            if rel in existing_files:
+                                existing_files.remove(rel)
+                        else:
+                            result.append((str(full_path), rel, None, None, size))
                     except (OSError, PermissionError):
                         continue
-        return result
+            return result
+        except Exception as e:
+            logger.error(f"Error walking directory {start_path}: {e}")
+            return []
 
     for item in HOME_DIR.iterdir():
         if item.is_file() and not should_ignore(item, ignore_patterns):
@@ -186,15 +234,19 @@ def collect_files_for_backup(ignore_patterns, dest_dir, incremental=False,  fast
             try:
                 size = os.path.getsize(item)
                 if incremental:
-                    mtime = os.path.getmtime(item)
-                    file_hash = calculate_file_hash(item)
-                    prev_metadata = metadata.get(rel, {})
-                    if file_hash and (prev_metadata.get("hash") != file_hash or prev_metadata.get("mtime") != mtime):
-                        all_files.append((str(item), rel, mtime, file_hash, size))
+                    mtime_int = int(os.path.getmtime(item))
+                    prev = metadata.get(rel, {})
+                    if fast:
+                        if is_changed_fast(prev, mtime_int, size):
+                            all_files.append((str(item), rel, mtime_int, None, size))
+                    else:
+                        file_hash = calculate_file_hash(item)
+                        if file_hash and (prev.get("hash") != file_hash or int(prev.get("mtime", 0)) != mtime_int):
+                            all_files.append((str(item), rel, mtime_int, file_hash, size))
+                    if rel in existing_files:
+                        existing_files.remove(rel)
                 else:
                     all_files.append((str(item), rel, None, None, size))
-                if rel in existing_files:
-                    existing_files.remove(rel)
             except (OSError, PermissionError):
                 continue
 
@@ -202,14 +254,17 @@ def collect_files_for_backup(ignore_patterns, dest_dir, incremental=False,  fast
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(walk_dir, d) for d in subdirs]
         for f in as_completed(futures):
-            all_files.extend(f.result())
+            try:
+                all_files.extend(f.result())
+            except Exception as e:
+                logger.error(f"Error in directory walk: {e}")
 
-    # Mark remaining files in metadata as deleted
     if incremental:
         for rel in existing_files:
             if not should_ignore(Path(HOME_DIR) / rel, ignore_patterns):
                 deleted_files.append(rel)
 
+    logger.info(f"Collected {len(all_files)} files and {len(deleted_files)} deleted files for backup")
     return all_files, deleted_files
 
 def safe_unmount(path):
@@ -220,17 +275,21 @@ def safe_unmount(path):
         print(f"\n❗ Failed to unmount {path}: {e}")
 
 def add_file_to_tar(tar, full_path, arcname, file_size, progress, large_file_task=None):
-    tarinfo = tar.gettarinfo(full_path, arcname=arcname)
-    tarinfo.mtime = os.path.getmtime(full_path)
+    try:
+        tarinfo = tar.gettarinfo(full_path, arcname=arcname)
+        tarinfo.mtime = os.path.getmtime(full_path)
 
-    with open(full_path, "rb") as f:
-        if file_size > LARGE_FILE_THRESHOLD and large_file_task is not None:
-            progress.update(large_file_task, total=file_size, completed=0, description=f"Adding {arcname}", visible=True)
-            wrapper = ProgressFileReader(f, progress, large_file_task)
-            tar.addfile(tarinfo, fileobj=wrapper)
-            progress.update(large_file_task, visible=False)
-        else:
-            tar.addfile(tarinfo, fileobj=f)
+        with open(full_path, "rb") as f:
+            if file_size > LARGE_FILE_THRESHOLD and large_file_task is not None:
+                progress.update(large_file_task, total=file_size, completed=0, description=f"Adding {arcname}", visible=True)
+                wrapper = ProgressFileReader(f, progress, large_file_task)
+                tar.addfile(tarinfo, fileobj=wrapper)
+                progress.update(large_file_task, visible=False)
+            else:
+                tar.addfile(tarinfo, fileobj=f)
+    except Exception as e:
+        logger.error(f"Failed to add file to tar {arcname}: {e}")
+        raise
 
 def create_backup(dest_dir, incremental=False, silent=False, fast=False):
     now = datetime.now()
@@ -240,9 +299,6 @@ def create_backup(dest_dir, incremental=False, silent=False, fast=False):
     disk = shutil.disk_usage(dest_dir)
     ignore_patterns = load_ignore_list()
 
-    if not silent:
-        print(f"🔍 Scanning files for {backup_type} backup (with .backupignore)...")
-    
     try:
         all_files, deleted_files = collect_files_for_backup(ignore_patterns, dest_dir, incremental, fast)
     except KeyboardInterrupt:
@@ -278,12 +334,9 @@ def create_backup(dest_dir, incremental=False, silent=False, fast=False):
             print("❌ Cancelled.")
             exit(0)
 
-    if disk.free < total_size * 1.1:  # Just in case, add 10%.
+    if disk.free < total_size * 1.1:
         print("❗ Not enough disk space!")
         exit(0)
-
-    if not silent:
-        print(f"\n🔐 Creating {backup_type} archive: {archive_path}\n")
 
     new_metadata = {}
     if incremental:
@@ -325,11 +378,9 @@ def create_backup(dest_dir, incremental=False, silent=False, fast=False):
                                 description=f"[cyan]Adding {rel}",
                                 visible=True
                             )
-                            print(f"Adding large file: {rel} ({size / (1024 * 1024):.2f} MB)")
                     else:
                         if not silent:
                             large_file_progress.update(large_file_task, visible=False)
-                            print(f"Adding: {rel} ({size / (1024 * 1024):.2f} MB)")
 
                     add_file_to_tar(tar, full_path, rel, size, large_file_progress, large_file_task)
 
@@ -347,14 +398,17 @@ def create_backup(dest_dir, incremental=False, silent=False, fast=False):
                     if not silent:
                         large_file_progress.update(large_file_task, visible=False)
 
-            # Add deleted files to metadata
-            if not silent:
+            if incremental and deleted_files:
+                deletion_ts = int(datetime.now().timestamp())
                 for rel in deleted_files:
-                    new_metadata[rel] = {"status": "deleted"}
-                    print(f"Marking as deleted: {rel}")
-                    main_progress.update(task, advance=1)
+                    new_metadata[rel] = {"status": "deleted", "mtime": deletion_ts}
+                    if not silent:
+                        main_progress.update(task, advance=1)
+
 
         save_metadata(new_metadata, dest_dir)
+        if not silent:
+            print(f"\n✅ {backup_type.capitalize()} backup complete!")
 
     except KeyboardInterrupt:
         print("\n⚠️ Backup interrupted by user (Ctrl+C).")
@@ -370,9 +424,6 @@ def create_backup(dest_dir, incremental=False, silent=False, fast=False):
         safe_unmount(dest_dir)
         sys.exit(1)
 
-    if not silent:
-        print(f"\n✅ {backup_type.capitalize()} backup complete!")
-
 if __name__ == "__main__":
     args = parse_args()
 
@@ -385,7 +436,9 @@ if __name__ == "__main__":
             sys.exit(1)
         restore_incrementals(args.backup_dir, args.dest)
     else:
+        logger.info("Initiating backup operation")
         mount_points = get_mount_points()
         dest = ask_user_path(mount_points, args.silent)
         create_backup(dest, args.incremental, args.silent, args.fast)
         safe_unmount(dest)
+        logger.info("Main execution completed")
