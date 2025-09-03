@@ -75,26 +75,19 @@ def restore_incrementals(backup_dir, dest_dir):
         print("❌ Restore cancelled.")
         return
 
-    processed_files = set()  # Track files that have been restored
-    latest_mtime = {}  # Track the latest mtime for each file
+    processed_files = set()
+    latest_mtime = {}
 
-    # Initialize progress bars
     main_progress = Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
         "[progress.percentage]{task.percentage:>3.0f}%",
-        TextColumn("{task.completed}/{task.total} files"),
+        TextColumn("{task.completed} files restored"),
         transient=False
     )
 
     with Live(main_progress, refresh_per_second=10):
-        total_files = 0
-        # First pass: count total files for progress bar
-        for backup_file, _, _ in backup_files:
-            with tarfile.open(backup_file, "r:gz") as tar:
-                total_files += sum(1 for member in tar if member.isfile() and not should_ignore(member.name, ignore_patterns))
-
-        task = main_progress.add_task("Restoring backups...", total=total_files)
+        task = main_progress.add_task("Restoring backups...", total=None)
 
         for backup_file, backup_type, _ in backup_files:
             print(f"\n📦 Processing {backup_file.name} ({backup_type})...")
@@ -110,28 +103,22 @@ def restore_incrementals(backup_dir, dest_dir):
                     dest_path = dest_dir / member.name
                     rel_path = member.name
 
-                    # Check metadata status
                     file_metadata = metadata.get(rel_path, {})
                     file_mtime = member.mtime
                     stored_mtime = latest_mtime.get(rel_path, 0)
                     file_status = file_metadata.get("status", "present")
 
-                    # Skip if the file is marked as deleted or ignored in metadata with a newer mtime
+                    # Skip if file is marked deleted or ignored with newer mtime
                     if file_status in ["deleted", "ignored"] and file_metadata.get("mtime", 0) >= file_mtime:
-                        print(f"⏭️ Skipping {rel_path} (status: {file_status})")
                         continue
 
                     if rel_path not in processed_files or file_mtime > stored_mtime:
                         try:
-                            # Ensure parent directories exist
                             dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-                            # Extract file only if status is present
                             if file_status == "present":
                                 tar.extract(member, path=dest_dir)
-                                print(f"✅ Restored: {rel_path}")
 
-                            # Update tracking
                             processed_files.add(rel_path)
                             latest_mtime[rel_path] = file_mtime
 
@@ -141,6 +128,7 @@ def restore_incrementals(backup_dir, dest_dir):
                             print(f"❗ Failed to restore {rel_path}: {e}")
 
     print(f"\n✅ Restore complete! Restored {len(processed_files)} files to {dest_dir}")
+
 
 if __name__ == "__main__":
     args = parse_restore()
